@@ -1,0 +1,423 @@
+name: QA Workbench — Deploy & Run Playwright
+
+# Triggered when QA Workbench pushes generated code + Playwright specs to the repo.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+  workflow_dispatch:
+    inputs:
+      story_id:
+        description: "Story ID to associate with this run"
+        required: false
+        default: "UNKNOWN"
+
+permissions:
+  contents: read
+  id-token: write   # for OIDC auth to AWS
+
+env:
+  AWS_REGION: us-east-1
+  # Set these as repo secrets/vars:
+  # QA_WORKBENCH_API: base URL of the QA Workbench HTTP API (https://xxxx.execute-api...)
+  # AWS_DEPLOY_ROLE_ARN (secret): IAM role for OIDC deploy/upload
+  QA_WORKBENCH_API: ${{ vars.QA_WORKBENCH_API }}
+  # Promote the secret to env so step `if:` conditions can reference it (you can't
+  # reference `secrets.*` directly in a job-level if).
+  AWS_DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+
+jobs:
+  deploy-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Bootstrap Playwright project if repo has no package.json
+        run: |
+          if [ ! -f package.json ]; then
+            echo "No package.json found — creating a minimal Playwright project."
+            cat > package.json <<'JSON'
+          {
+            "name": "qa-workbench-specs",
+            "private": true,
+            "version": "1.0.0",
+            "devDependencies": { "@playwright/test": "^1.48.0" }
+          }
+          JSON
+          fi
+          if [ ! -f playwright.config.ts ] && [ ! -f playwright.config.js ]; then
+            echo "No Playwright config found — creating one."
+            cat > playwright.config.ts <<'TS'
+          import { defineConfig, devices } from '@playwright/test';
+          export default defineConfig({
+            testDir: './tests',
+            retries: 0,
+            maxFailures: Number(process.env.PW_MAX_FAILURES || 10),
+            timeout: Number(process.env.PW_TIMEOUT || 15000),
+            reporter: [['list'], ['json', { outputFile: 'results.json' }], ['html', { open: 'never', outputFolder: 'playwright-report' }]],
+            use: { baseURL: process.env.BASE_URL || 'http://localhost:3000', trace: 'on-first-retry', screenshot: 'only-on-failure', video: 'retain-on-failure' },
+            projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+          });
+          TS
+          fi
+
+      - name: Resolve Playwright version (for cache keys)
+        id: pwver
+        run: |
+          # Pull the pinned @playwright/test version from package.json; fall back to a default.
+          VER=$(node -p "try{require('./package.json').devDependencies['@playwright/test'].replace(/[^0-9.]/g,'')}catch(e){''}")
+          if [ -z "$VER" ]; then VER="1.48.0"; fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Playwright version for cache: $VER"
+
+      - name: Restore npm modules cache
+        id: npm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            ~/.npm
+          # No lockfile in this repo, so key on the resolved Playwright version + OS.
+          key: ${{ runner.os }}-npm-pw-${{ steps.pwver.outputs.version }}
+          restore-keys: |
+            ${{ runner.os }}-npm-pw-
+
+      - name: Restore Playwright browser cache
+        id: pw-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.pwver.outputs.version }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Report cache status
+        run: |
+          echo "cache key version: ${{ steps.pwver.outputs.version }}"
+          echo "Playwright browser cache-hit: ${{ steps.pw-cache.outputs.cache-hit }}"
+          echo "(first run with a given Playwright version misses and populates the cache;"
+          echo " later runs should report 'true')"
+
+      - name: Install dependencies
+        run: |
+          # Install JS deps. node_modules may be restored from cache; install is then
+          # fast / a no-op when already satisfied.
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+          # Install the Chromium browser only if the cache missed. The system deps
+          # (apt packages) aren't cached, so install those cheaply regardless; the
+          # browser binary itself is what the cache saves (the slow 1-3 min part).
+          if [ "${{ steps.pw-cache.outputs.cache-hit }}" == "true" ]; then
+            echo "Playwright browser restored from cache — installing system deps only."
+            npx playwright install-deps chromium
+          else
+            echo "::group::Installing Playwright browser (Chromium) — cache miss"
+            npx playwright install --with-deps chromium
+            echo "::endgroup::"
+          fi
+          echo "Dependencies ready."
+
+      # Save caches RIGHT AFTER install (not in a post-step), so they persist even when
+      # the test job later fails or is canceled. Only save on a miss to avoid key clashes.
+      - name: Save Playwright browser cache
+        if: always() && steps.pw-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.pwver.outputs.version }}
+
+      - name: Save npm modules cache
+        if: always() && steps.npm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            node_modules
+            ~/.npm
+          key: ${{ runner.os }}-npm-pw-${{ steps.pwver.outputs.version }}
+
+      # ----- Deploy the application under test to AWS -----
+      # Example: build the React app and sync to the app's own S3+CloudFront.
+      # Replace with your real deploy target. Uses OIDC role assumption.
+      - name: Configure AWS credentials
+        if: ${{ env.AWS_DEPLOY_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve the app URL to test against
+        id: deploy
+        run: |
+          # The specs target a running app. Set the repo variable APP_UNDER_TEST_URL
+          # to your deployed enrollment app (e.g. its CloudFront URL).
+          if [ -n "${{ vars.APP_UNDER_TEST_URL }}" ]; then
+            echo "BASE_URL=${{ vars.APP_UNDER_TEST_URL }}" >> "$GITHUB_ENV"
+            echo "Testing against ${{ vars.APP_UNDER_TEST_URL }}"
+          elif [ -f vite.config.js ] || [ -f vite.config.ts ]; then
+            # Repo is a full app — build and preview it locally.
+            npm run build || echo "no build step"
+            nohup npx vite preview --port 3000 --host > preview.log 2>&1 &
+            npx wait-on http://localhost:3000 --timeout 60000 || true
+            echo "BASE_URL=http://localhost:3000" >> "$GITHUB_ENV"
+          else
+            echo "::warning::APP_UNDER_TEST_URL not set and no app to build; defaulting BASE_URL to http://localhost:3000 (tests will likely fail to connect)."
+            echo "BASE_URL=http://localhost:3000" >> "$GITHUB_ENV"
+          fi
+
+      - name: Pre-flight — verify the app URL is reachable
+        run: |
+          echo "Checking $BASE_URL ..."
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$BASE_URL" || echo "000")
+          echo "HTTP status: $code"
+          if [ "$code" = "000" ]; then
+            echo "::error::Cannot reach $BASE_URL — tests would hang on every navigation. Set the APP_UNDER_TEST_URL repo variable to a live app URL."
+            exit 1
+          fi
+          if [ "$code" -ge 400 ]; then
+            echo "::warning::$BASE_URL returned HTTP $code — the app may not be serving correctly."
+          fi
+
+      # ----- Run the generated Playwright suite -----
+      - name: Run Playwright tests
+        id: pw
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          PWDEBUG: "0"
+          PLAYWRIGHT_JSON_OUTPUT_NAME: results.json
+          PW_MAX_FAILURES: "10"   # stop after 10 failures (systemic problem -> bail fast)
+          PW_TIMEOUT: "15000"     # 15s per test
+        run: |
+          # list reporter streams one line per test live; json+html produce files.
+          # --max-failures bails the whole run once N tests fail so a broken suite
+          # can't run to the 10-minute ceiling. retries are 0 in the config (no
+          # double-time on failures).
+          npx playwright test \
+            --reporter=list,json,html \
+            --timeout=15000 \
+            --max-failures=10 \
+            --workers=2 \
+            --output=test-results
+          # NOTE: no output redirection — everything prints in the UI above.
+
+      - name: Summarize results
+        id: summary
+        run: |
+          python3 - <<'PY'
+          import json, os
+          summary = {"passed": 0, "failed": 0, "skipped": 0, "duration": 0}
+          report = {}
+          try:
+              with open("results.json") as f:
+                  report = json.load(f)
+              seen = set()
+              def walk(suites):
+                  for s in suites:
+                      for spec in s.get("specs", []):
+                          file = s.get("file") or spec.get("file", "")
+                          spec_id = spec.get("id") or f"{file}::{spec.get('title','')}::{spec.get('line','')}"
+                          if spec_id in seen:
+                              continue
+                          seen.add(spec_id)
+                          for t in spec.get("tests", []):
+                              results = t.get("results", []) or []
+                              if not results:
+                                  continue
+                              r = results[-1]  # final attempt only
+                              st = r.get("status")
+                              summary["duration"] += r.get("duration", 0)
+                              if st == "passed": summary["passed"] += 1
+                              elif st == "skipped": summary["skipped"] += 1
+                              else: summary["failed"] += 1
+                      walk(s.get("suites", []))
+              walk(report.get("suites", []))
+          except Exception as e:
+              print("parse error:", e)
+          with open("summary.json", "w") as f:
+              json.dump(summary, f)
+          print("SUMMARY", summary)
+          PY
+
+      - name: Read HTML report
+        id: html
+        run: |
+          if [ -f playwright-report/index.html ]; then
+            echo "has_html=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_html=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ----- Upload all run artifacts (screenshots, traces, HTML report) to S3 -----
+      # Uses the AWS creds configured earlier. Set the repo Variable
+      # QA_ARTIFACTS_BUCKET to the QA Workbench artifacts bucket name.
+      - name: Upload run artifacts to S3
+        id: s3
+        if: ${{ always() && vars.QA_ARTIFACTS_BUCKET != '' && env.AWS_DEPLOY_ROLE_ARN != '' }}
+        env:
+          STORY_ID: ${{ github.event.inputs.story_id }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          PREFIX="runs/${STORY_ID:-UNKNOWN}/${RUN_ID}/artifacts"
+          echo "S3_PREFIX=$PREFIX" >> "$GITHUB_ENV"
+          # Per-test screenshots, traces, videos
+          if [ -d test-results ]; then
+            aws s3 sync test-results/ "s3://${{ vars.QA_ARTIFACTS_BUCKET }}/$PREFIX/test-results/" --only-show-errors
+          fi
+          # Full HTML report (so the "Open HTML report" link works)
+          if [ -d playwright-report ]; then
+            aws s3 sync playwright-report/ "s3://${{ vars.QA_ARTIFACTS_BUCKET }}/$PREFIX/playwright-report/" --only-show-errors
+          fi
+          echo "Uploaded artifacts to s3://${{ vars.QA_ARTIFACTS_BUCKET }}/$PREFIX/"
+
+      # ----- Post results back to QA Workbench (-> S3 + DynamoDB) -----
+      - name: Post run report to QA Workbench
+        if: ${{ always() && env.QA_WORKBENCH_API != '' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, glob
+
+          api = os.environ["QA_WORKBENCH_API"].rstrip("/")
+          story_id = os.environ.get("STORY_ID") or "${{ github.event.inputs.story_id }}" or "UNKNOWN"
+
+          def load(path, default):
+              try:
+                  with open(path) as f: return json.load(f)
+              except Exception: return default
+
+          summary = load("summary.json", {})
+          report = load("results.json", {})
+          manifest = load("tests/suite.manifest.json", {})
+          project = manifest.get("project", "")
+          s3_prefix = os.environ.get("S3_PREFIX", "")
+
+          import re
+          _ansi = re.compile(r"\x1b\[[0-9;]*m")
+          def clean(text):
+              # strip ANSI color codes and the stray '[22m' style leftovers
+              text = _ansi.sub("", text or "")
+              text = re.sub(r"\[\d+m", "", text)
+              return text.strip()
+
+          def humanize(err):
+              """Turn a Playwright error into one plain-English sentence."""
+              e = clean(err)
+              if not e:
+                  return ""
+              low = e.lower()
+              # locator / expectation timeouts
+              m = re.search(r"getBy\w+\([^)]*\)", e)
+              loc = m.group(0) if m else "the element"
+              exp = re.search(r"Expected:\s*(.+)", e)
+              got = re.search(r"Received:\s*(.+)", e)
+              if "tobedisabled" in low.replace(" ", ""):
+                  return f"Expected {loc} to be disabled, but it was enabled."
+              if "tobeenabled" in low.replace(" ", ""):
+                  return f"Expected {loc} to be enabled, but it was disabled."
+              if "tobevisible" in low.replace(" ", ""):
+                  return f"Expected {loc} to be visible, but it was not found on the page."
+              if "tobehidden" in low.replace(" ", ""):
+                  return f"Expected {loc} to be hidden, but it was visible."
+              if "tohavetext" in low.replace(" ", "") or "tocontaintext" in low.replace(" ", ""):
+                  ev = f" Expected {exp.group(1).strip()}." if exp else ""
+                  gv = f" Got {got.group(1).strip()}." if got else ""
+                  return f"Text assertion on {loc} failed.{ev}{gv}"
+              if "net::err" in low or "err_connection" in low or "err_name_not_resolved" in low:
+                  return "Could not reach the app URL — check APP_UNDER_TEST_URL is live."
+              if "timeout" in low and "waiting for" in low:
+                  return f"Timed out waiting for {loc} — it never appeared/matched."
+              if "strict mode violation" in low:
+                  return f"Selector {loc} matched multiple elements (needs to be more specific)."
+              # fallback: first meaningful line
+              first = next((ln.strip() for ln in e.splitlines() if ln.strip()), "")
+              return first[:160]
+
+          # Build a per-test list: ONE entry per test (using the final result, not
+          # every attempt), de-duplicated by spec id so a test never appears twice.
+          tests = []
+          seen = set()
+          def walk(suites):
+              for s in suites:
+                  for spec in s.get("specs", []):
+                      file = s.get("file") or spec.get("file", "")
+                      spec_id = spec.get("id") or f"{file}::{spec.get('title','')}::{spec.get('line','')}"
+                      if spec_id in seen:
+                          continue
+                      seen.add(spec_id)
+                      for t in spec.get("tests", []):
+                          results = t.get("results", []) or []
+                          if not results:
+                              continue
+                          r = results[-1]  # final attempt is the authoritative outcome
+                          atts = []
+                          for a in r.get("attachments", []):
+                              p = a.get("path") or ""
+                              rel = p.split("test-results/")[-1] if "test-results/" in p else os.path.basename(p)
+                              if rel:
+                                  atts.append({"name": a.get("name"), "contentType": a.get("contentType"), "rel": rel})
+                          raw_err = (r.get("error", {}) or {}).get("message", "")
+                          tests.append({
+                              "title": spec.get("title", ""),
+                              "file": file,
+                              "status": r.get("status", "unknown"),
+                              "duration": r.get("duration", 0),
+                              "error": clean(raw_err)[:2000],
+                              "summary": humanize(raw_err),
+                              "attachments": atts,
+                          })
+                  walk(s.get("suites", []))
+          walk(report.get("suites", []))
+
+          html = None
+          try:
+              with open("playwright-report/index.html") as f:
+                  html = f.read()
+          except Exception:
+              pass
+
+          payload = {
+              "story_id": story_id,
+              "project": project,
+              "run_id": os.environ.get("GITHUB_RUN_ID"),
+              "status": "completed",
+              "summary": summary,
+              "tests": tests,
+              "s3_artifacts_prefix": s3_prefix,
+              "html_report": html,
+              "commit_sha": os.environ.get("GITHUB_SHA", ""),
+              "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY','')}/actions/runs/{os.environ.get('GITHUB_RUN_ID','')}",
+          }
+          data = json.dumps(payload).encode()
+          req = urllib.request.Request(api + "/runs/report", data=data,
+                                       headers={"Content-Type": "application/json"}, method="POST")
+          with urllib.request.urlopen(req) as r:
+              print("Reported:", r.read().decode())
+          PY
+        env:
+          STORY_ID: ${{ github.event.inputs.story_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+      - name: Upload Playwright report artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            results.json
+            test-results/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Fail job if tests failed
+        if: ${{ steps.pw.outcome == 'failure' }}
+        run: exit 1
