@@ -13,6 +13,10 @@ on:
         description: "Story ID to associate with this run"
         required: false
         default: "UNKNOWN"
+      actor:
+        description: "User (profile) who triggered this run"
+        required: false
+        default: "unknown"
 
 permissions:
   contents: read
@@ -385,6 +389,7 @@ jobs:
           payload = {
               "story_id": story_id,
               "project": project,
+              "actor": os.environ.get("ACTOR") or "${{ github.event.inputs.actor }}" or "unknown",
               "run_id": os.environ.get("GITHUB_RUN_ID"),
               "status": "completed",
               "summary": summary,
