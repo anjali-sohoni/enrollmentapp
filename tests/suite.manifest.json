@@ -2,6 +2,18 @@
   "project": "EV",
   "cases": [
     {
+      "id": "TC-0040-01",
+      "title": "Verify Continue button is disabled when required fields are empty"
+    },
+    {
+      "id": "TC-0040-03",
+      "title": "Verify required field indicators are visually distinct"
+    },
+    {
+      "id": "TC-0040-04",
+      "title": "Verify error message displays when attempting to advance with incomplete data"
+    },
+    {
       "id": "TC-0027-07",
       "title": "Validate pharmacy name field not empty"
     },
@@ -12,6 +24,10 @@
     {
       "id": "TC-0027-09",
       "title": "Validate phone number format"
+    },
+    {
+      "id": "TC-0040-02",
+      "title": "Verify Continue button enables when all required fields are populated"
     }
   ]
 }
