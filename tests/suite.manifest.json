@@ -2,16 +2,16 @@
   "project": "EV",
   "cases": [
     {
-      "id": "TC-0175-03",
-      "title": "Error message explains ineligibility reason"
+      "id": "TC-0027-07",
+      "title": "Validate pharmacy name field not empty"
     },
     {
-      "id": "TC-0175-04",
-      "title": "User can modify ZIP code and retry validation"
+      "id": "TC-0027-08",
+      "title": "Validate address field contains all required components"
     },
     {
-      "id": "TC-0175-06",
-      "title": "Reject empty ZIP code field"
+      "id": "TC-0027-09",
+      "title": "Validate phone number format"
     }
   ]
 }
