@@ -4,6 +4,14 @@
     {
       "id": "TC-0175-03",
       "title": "Error message explains ineligibility reason"
+    },
+    {
+      "id": "TC-0175-06",
+      "title": "Reject empty ZIP code field"
+    },
+    {
+      "id": "TC-0175-04",
+      "title": "User can modify ZIP code and retry validation"
     }
   ]
 }
